@@ -20,7 +20,8 @@ from hw1_imitation.data import (
     load_pusht_zarr,
 )
 from hw1_imitation.model import build_policy, PolicyType
-from hw1_imitation.evaluation import Logger
+from hw1_imitation.evaluation import Logger, evaluate_policy
+
 
 LOGDIR_PREFIX = "exp"
 
@@ -42,9 +43,9 @@ class TrainConfig:
     weight_decay: float = 0.0
     hidden_dims: tuple[int, ...] = (256, 256, 256)
     # The number of epochs to train for.
-    num_epochs: int = 400
+    num_epochs: int = 1000
     # How often to run evaluation, measured in training steps.
-    eval_interval: int = 10_000
+    eval_interval: int = 20_000
     num_video_episodes: int = 5
     video_size: tuple[int, int] = (256, 256)
     # How often to log training metrics, measured in training steps.
@@ -127,8 +128,54 @@ def run_training(config: TrainConfig) -> None:
     )
     logger = Logger(log_dir)
 
-    ### TODO: PUT YOUR MAIN TRAINING LOOP HERE ###
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    
+    model.train()
+    global_step = 0
+    for epoch in range(config.num_epochs):
+        for batch in loader:
+            states_batch, actions_batch = batch
+            states_batch = states_batch.to(device)
+            actions_batch = actions_batch.to(device)
 
+            loss = model.compute_loss(states_batch, actions_batch)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            global_step += 1
+
+            if global_step % config.log_interval == 0:
+                logger.log({"train/loss": loss.item()}, step=global_step)
+                print(f"Epoch {epoch}/{config.num_epochs}, Step {global_step}, Loss: {loss.item():.4f}")
+
+            if global_step % config.eval_interval == 0:
+                evaluate_policy(
+                    model=model,
+                    normalizer=normalizer,
+                    device=device,
+                    chunk_size=config.chunk_size,
+                    video_size=config.video_size,
+                    num_video_episodes=config.num_video_episodes,
+                    flow_num_steps=config.flow_num_steps,
+                    step=global_step,
+                    logger=logger
+                )
+                model.train()
+
+    # final evaluation
+    evaluate_policy(
+        model=model,
+        normalizer=normalizer,
+        device=device,
+        chunk_size=config.chunk_size,
+        video_size=config.video_size,
+        num_video_episodes=config.num_video_episodes,
+        flow_num_steps=config.flow_num_steps,
+        step=global_step,
+        logger=logger
+    )
     logger.dump_for_grading()
 
 
