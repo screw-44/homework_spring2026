@@ -67,7 +67,7 @@ def log_action_prediction_grid(
     T = gt_np.shape[1]
     t = np.arange(T)
 
-    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
     for i, ax in enumerate(axes.flat):
         if i >= N:
             ax.axis("off")
