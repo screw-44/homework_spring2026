@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import tyro
@@ -19,11 +20,70 @@ from hw1_imitation.data import (
     download_pusht,
     load_pusht_zarr,
 )
-from hw1_imitation.model import build_policy, PolicyType
+from hw1_imitation.model import build_policy, PolicyType, BasePolicy
 from hw1_imitation.evaluation import Logger, evaluate_policy
 
 
 LOGDIR_PREFIX = "exp"
+
+
+def log_action_prediction_grid(
+    model: BasePolicy,
+    states_batch: torch.Tensor,
+    actions_batch: torch.Tensor,
+    logger: Logger,
+    step: int,
+    flow_num_steps: int = 10,
+) -> None:
+    """Plot GT vs model-predicted action curves for the first 8 samples in the batch.
+
+    Creates a 4-row × 2-col grid of subplots (one per sample), each showing
+    the GT action trajectory and the predicted one.  The figure caption
+    includes the mean MSE across the 8 samples.
+
+    Args:
+        model: policy (will be temporarily switched to eval mode).
+        states_batch: ``[batch, state_dim]`` on the model's device.
+        actions_batch: ``[batch, chunk_size, action_dim]``.
+        logger: Logger instance used to push the image to WandB.
+        step: current global training step.
+        flow_num_steps: Euler steps for flow-based policies.
+    """
+    N = min(4, states_batch.size(0))
+    gt = actions_batch[:N]  # [N, chunk_size, action_dim]
+
+    model.eval()
+    with torch.no_grad():
+        pred = model.sample_actions(states_batch, num_steps=flow_num_steps)  # [batch, chunk_size, action_dim], beast不能切除后再压缩
+    model.train()
+
+    pred = pred[:N]
+
+    mse_per_sample = ((pred - gt) ** 2).mean(dim=(1, 2))  # [N]
+    mean_mse = mse_per_sample.mean().item()
+
+    gt_np   = gt.cpu().numpy()    # [N, T, D]
+    pred_np = pred.cpu().numpy()  # [N, T, D]
+    T = gt_np.shape[1]
+    t = np.arange(T)
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+    for i, ax in enumerate(axes.flat):
+        if i >= N:
+            ax.axis("off")
+            continue
+        for d in range(gt_np.shape[2]):
+            ax.plot(t, gt_np[i, :, d],   linestyle="--", alpha=0.7, label=f"GT dim{d}")
+            ax.plot(t, pred_np[i, :, d], linestyle="-",  alpha=0.9, label=f"Pred dim{d}")
+        ax.set_title(f"sample {i}  MSE={mse_per_sample[i].item():.4f}", fontsize=8)
+        ax.legend(fontsize=6)
+        ax.tick_params(labelsize=6)
+
+    fig.suptitle(f"step={step}  mean MSE (4 samples) = {mean_mse:.4f}", fontsize=10)
+    fig.tight_layout()
+
+    logger.log({"train/action_pred_grid": wandb.Image(fig)}, step=step)
+    plt.close(fig)
 
 
 @dataclass
@@ -42,6 +102,9 @@ class TrainConfig:
     # The data is linearly interpolated to this size during training and back
     # to chunk_size during inference.  Ignored for other policy types.
     after_scale_chunk_size: int | None = None
+    # For exp3_2_low_pass_flow: the kernel size of the low-pass Conv1d filter.
+    # Ignored for other policy types.
+    kernel_size: int | None = None
 
     batch_size: int = 128
     lr: float = 3e-4
@@ -123,6 +186,7 @@ def run_training(config: TrainConfig) -> None:
         chunk_size=config.chunk_size,
         hidden_dims=config.hidden_dims,
         after_scale_chunk_size=config.after_scale_chunk_size,
+        kernel_size=config.kernel_size,
     ).to(device)
 
     exp_name = f"seed_{config.seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -157,6 +221,14 @@ def run_training(config: TrainConfig) -> None:
                 print(f"Epoch {epoch}/{config.num_epochs}, Step {global_step}, Loss: {loss.item():.4f}")
 
             if global_step % config.eval_interval == 0:
+                log_action_prediction_grid(
+                    model=model,
+                    states_batch=states_batch,
+                    actions_batch=actions_batch,
+                    logger=logger,
+                    step=global_step,
+                    flow_num_steps=config.flow_num_steps,
+                )
                 evaluate_policy(
                     model=model,
                     normalizer=normalizer,
