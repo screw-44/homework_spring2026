@@ -38,6 +38,11 @@ class TrainConfig:
     # The action chunk size.
     chunk_size: int = 8
 
+    # For exp2 and exp3: the chunk size the model actually works at.
+    # The data is linearly interpolated to this size during training and back
+    # to chunk_size during inference.  Ignored for other policy types.
+    after_scale_chunk_size: int | None = None
+
     batch_size: int = 128
     lr: float = 3e-4
     weight_decay: float = 0.0
@@ -117,6 +122,7 @@ def run_training(config: TrainConfig) -> None:
         action_dim=actions.shape[1],
         chunk_size=config.chunk_size,
         hidden_dims=config.hidden_dims,
+        after_scale_chunk_size=config.after_scale_chunk_size,
     ).to(device)
 
     exp_name = f"seed_{config.seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
