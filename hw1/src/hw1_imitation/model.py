@@ -340,7 +340,132 @@ class Exp3BeastFlowMatchingPolicy(BasePolicy):
 
         return self._decode(x_t)  # [batch, chunk_size, action_dim]
 
-PolicyType: TypeAlias = Literal["mse", "flow", "exp2_sparse_flow", "exp3_beast_flow"]
+class Exp3_2LowPassFlowMatchingPolicy(BasePolicy):
+    """Flow matching policy that operates at a rescaled chunk resolution + 低阶滤波.
+
+    The network works internally at ``after_scale_chunk_size`` resolution.
+    - Training:  action chunk (``chunk_size``) is interpolated to
+      ``after_scale_chunk_size`` before computing the flow matching loss.
+    - Inference: actions are generated at ``after_scale_chunk_size`` and
+      interpolated back to ``chunk_size`` before returning.
+
+    低阶滤波采用的是conv1d来进行实现，传入kernel size的参数。
+
+    This lets you study whether *point count* or *represented time span*
+    drives policy performance.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        after_scale_chunk_size: int,
+        hidden_dims: tuple[int, ...] = (128, 128),
+        kernel_size: int = 5,
+    ) -> None:
+        super().__init__(state_dim, action_dim, chunk_size)
+        self.after_scale_chunk_size = after_scale_chunk_size
+        self.kernel_size = kernel_size # 需要测试为奇数
+
+        # Low-pass filter: depthwise Conv1d (per-channel), same-length output.
+        # Initialized as a uniform averaging kernel.
+        self.low_pass = nn.Conv1d(
+            in_channels=action_dim,
+            out_channels=action_dim,
+            kernel_size=kernel_size,
+            groups=action_dim,
+            padding="same",
+            bias=False,
+        )
+        nn.init.constant_(self.low_pass.weight, 1.0 / kernel_size) # 初始化成均值滤波器
+        for p in self.low_pass.parameters(): # 进行冻结
+            p.requires_grad_(False)
+
+        # Network input: state + flat actions at scaled resolution + timestep
+        flat_scaled_dim = after_scale_chunk_size * action_dim
+        layers: list[nn.Module] = []
+        in_dim = state_dim + flat_scaled_dim + 1
+        for h_dim in hidden_dims:
+            layers.extend([nn.Linear(in_dim, h_dim), nn.ReLU()])
+            in_dim = h_dim
+        layers.append(nn.Linear(in_dim, flat_scaled_dim))
+        self.net = nn.Sequential(*layers)
+
+        print(
+            f"Exp3_2LowPassFlowMatchingPolicy: chunk_size={chunk_size} -> "
+            f"after_scale={after_scale_chunk_size}, kernel_size={kernel_size}\n"
+            f"self.net:{self.net}"
+        )
+
+    def _interp(self, actions: torch.Tensor, target_len: int) -> torch.Tensor:
+        """Linearly interpolate ``[batch, src_len, action_dim]`` to ``target_len``."""
+        if actions.shape[1] == target_len:
+            return actions
+        # F.interpolate expects (N, C, L)
+        x = actions.permute(0, 2, 1)
+        x = nn.functional.interpolate(x, size=target_len, mode="linear", align_corners=True)
+        return x.permute(0, 2, 1)
+
+    def _filter(self, actions: torch.Tensor) -> torch.Tensor:
+        """Low-pass filter then downsample to ``after_scale_chunk_size``.
+
+        Steps:
+        1. Smooth with a depthwise Conv1d (same padding → output length == input length).
+        2. Linearly interpolate to ``after_scale_chunk_size``.
+
+        Args:
+            actions: ``[batch, chunk_size, action_dim]``
+        Returns:
+            ``[batch, after_scale_chunk_size, action_dim]``
+        """
+        # Conv1d expects (N, C, L)
+        x = actions.permute(0, 2, 1)   # [batch, action_dim, chunk_size]
+        x = self.low_pass(x)           # [batch, action_dim, chunk_size]  (same padding)
+        x = x.permute(0, 2, 1)         # [batch, chunk_size, action_dim]
+        return self._interp(x, self.after_scale_chunk_size)
+
+    def compute_loss(
+        self,
+        state: torch.Tensor,        # [batch, state_dim]
+        action_chunk: torch.Tensor, # [batch, chunk_size, action_dim]
+    ) -> torch.Tensor:
+        batch_size = state.size(0)
+        # Low-pass filter then scale ground-truth chunk to the internal resolution
+        x_1 = self._filter(action_chunk)
+        x_1 = x_1.reshape(batch_size, -1)  # [batch, flat_scaled_dim]
+
+        x_0 = torch.randn_like(x_1)
+        t = torch.rand(batch_size, 1, device=state.device)
+        x_t = (1.0 - t) * x_0 + t * x_1
+        u_t = x_1 - x_0  # target velocity
+
+        pred_u_t = self.net(torch.cat([state, x_t, t], dim=-1))
+        return nn.functional.mse_loss(pred_u_t, u_t)
+
+    def sample_actions(
+        self,
+        state: torch.Tensor,
+        *,
+        num_steps: int = 10,
+    ) -> torch.Tensor:
+        batch_size = state.size(0)
+        flat_scaled_dim = self.after_scale_chunk_size * self.action_dim
+
+        # Euler integration at the internal scaled resolution
+        x_t = torch.randn(batch_size, flat_scaled_dim, device=state.device)
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t = torch.full((batch_size, 1), i * dt, device=state.device)
+            x_t = x_t + self.net(torch.cat([state, x_t, t], dim=-1)) * dt
+
+        scaled = x_t.reshape(batch_size, self.after_scale_chunk_size, self.action_dim)
+        # Interpolate back to the real chunk_size
+        return self._interp(scaled, self.chunk_size)
+
+PolicyType: TypeAlias = Literal[
+    "mse", "flow", "exp2_sparse_flow", "exp3_beast_flow", "exp3_2_low_pass_flow"
+]
 
 
 def build_policy(
@@ -351,6 +476,7 @@ def build_policy(
     chunk_size: int,
     hidden_dims: tuple[int, ...] = (128, 128),
     after_scale_chunk_size: int | None = None,
+    kernel_size: int | None = None,
 ) -> BasePolicy:
     if policy_type == "mse":
         return MSEPolicy(
@@ -389,5 +515,18 @@ def build_policy(
             chunk_size=chunk_size,
             after_scale_chunk_size=after_scale_chunk_size,
             hidden_dims=hidden_dims,
+        )
+    if policy_type == "exp3_2_low_pass_flow":
+        if after_scale_chunk_size is None or kernel_size is None:
+            raise ValueError(
+                "after_scale_chunk_size and kernel_size must be provided for exp3_2_low_pass_flow"
+            )
+        return Exp3_2LowPassFlowMatchingPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            after_scale_chunk_size=after_scale_chunk_size,
+            hidden_dims=hidden_dims,
+            kernel_size=kernel_size,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")
