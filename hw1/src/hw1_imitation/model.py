@@ -463,8 +463,200 @@ class Exp3_2LowPassFlowMatchingPolicy(BasePolicy):
         # Interpolate back to the real chunk_size
         return self._interp(scaled, self.chunk_size)
 
+# Note: 构造的encode和decode的误差太大了，不进行模型训练测试了。
+class Exp3_3RandomBasisFlowMatchingPolicy(BasePolicy):
+    """Flow matching policy whose latent space is a random orthogonal projection.
+
+    A fixed random orthogonal basis ``B`` of shape ``[chunk_size, after_scale_chunk_size]``
+    (orthonormal columns, B^T B = I) is constructed once at init and registered
+    as a non-trainable buffer.
+
+    - Encode: z = x @ B          [batch, chunk_size, D] → [batch, after_scale, D]
+    - Decode: x̂ = z @ B^T        [batch, after_scale, D] → [batch, chunk_size, D]
+
+    Network structure is identical to Exp2SparseFlowMatchingPolicy.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        after_scale_chunk_size: int,
+        hidden_dims: tuple[int, ...] = (128, 128),
+    ) -> None:
+        super().__init__(state_dim, action_dim, chunk_size)
+        self.after_scale_chunk_size = after_scale_chunk_size
+
+        # Random orthogonal basis: QR decomposition of a random matrix.
+        # B: [chunk_size, after_scale_chunk_size],  B^T B = I
+        rand = torch.randn(chunk_size, after_scale_chunk_size)
+        B, _ = torch.linalg.qr(rand)          # B: [chunk_size, after_scale_chunk_size]
+        self.register_buffer("B", B)           # fixed, not a parameter
+
+        flat_latent_dim = after_scale_chunk_size * action_dim
+        layers: list[nn.Module] = []
+        in_dim = state_dim + flat_latent_dim + 1
+        for h_dim in hidden_dims:
+            layers.extend([nn.Linear(in_dim, h_dim), nn.ReLU()])
+            in_dim = h_dim
+        layers.append(nn.Linear(in_dim, flat_latent_dim))
+        self.net = nn.Sequential(*layers)
+
+        print(f"Exp3_3RandomBasisFlowMatchingPolicy: chunk_size={chunk_size} -> after_scale={after_scale_chunk_size}")
+
+    def _encode(self, actions: torch.Tensor) -> torch.Tensor:
+        """Project [batch, chunk_size, action_dim] → [batch, after_scale, action_dim]."""
+        return torch.einsum("btd,tk->bkd", actions, self.B)
+
+    def _decode(self, latent: torch.Tensor) -> torch.Tensor:
+        """Unproject [batch, after_scale, action_dim] → [batch, chunk_size, action_dim]."""
+        return torch.einsum("bkd,tk->btd", latent, self.B)
+
+    def compute_loss(
+        self,
+        state: torch.Tensor,        # [batch, state_dim]
+        action_chunk: torch.Tensor, # [batch, chunk_size, action_dim]
+    ) -> torch.Tensor:
+        batch_size = state.size(0)
+        x_1 = self._encode(action_chunk).reshape(batch_size, -1)  # [batch, flat_latent_dim]
+
+        x_0 = torch.randn_like(x_1)
+        t = torch.rand(batch_size, 1, device=state.device)
+        x_t = (1.0 - t) * x_0 + t * x_1
+        u_t = x_1 - x_0
+
+        pred_u_t = self.net(torch.cat([state, x_t, t], dim=-1))
+        return nn.functional.mse_loss(pred_u_t, u_t)
+
+    def sample_actions(
+        self,
+        state: torch.Tensor,
+        *,
+        num_steps: int = 10,
+    ) -> torch.Tensor:
+        batch_size = state.size(0)
+        flat_latent_dim = self.after_scale_chunk_size * self.action_dim
+
+        x_t = torch.randn(batch_size, flat_latent_dim, device=state.device)
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t = torch.full((batch_size, 1), i * dt, device=state.device)
+            x_t = x_t + self.net(torch.cat([state, x_t, t], dim=-1)) * dt
+
+        latent = x_t.reshape(batch_size, self.after_scale_chunk_size, self.action_dim)
+        return self._decode(latent)  # [batch, chunk_size, action_dim]
+
+class Exp4AdaptiveSplineFlowMatchingPolicy(BasePolicy):
+    """ Flow matching policy that adaptively chooses B-spline control points based on the input state."""
+    # 实现的难度很大，训练时间很久。先不测试
+    pass
+
+class Exp5LearnEDFlowMatchingPolicy(BasePolicy):
+    """Flow matching policy with a learnable encoder/decoder compressing action space.
+
+    - Encoder: flat action [chunk*D] → latent [after_scale*D]
+    - Decoder: latent [after_scale*D] → flat action [chunk*D]
+    - Flow net: operates entirely in the **latent** space.
+
+    Training loss = flow matching loss (in latent) + reconstruction loss (decoder∘encoder ≈ id).
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        after_scale_chunk_size: int,
+        hidden_dims: tuple[int, ...] = (128, 128),
+    ) -> None:
+        super().__init__(state_dim, action_dim, chunk_size)
+        self.after_scale_chunk_size = after_scale_chunk_size
+        flat_action_dim = chunk_size * action_dim
+        latent_dim = after_scale_chunk_size * action_dim
+
+        # Encoder / decoder with one hidden layer for nonlinearity
+        enc_hidden = hidden_dims[0]
+        self.encoder = nn.Sequential(
+            nn.Linear(flat_action_dim, enc_hidden),
+            nn.ReLU(),
+            nn.Linear(enc_hidden, latent_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, enc_hidden),
+            nn.ReLU(),
+            nn.Linear(enc_hidden, flat_action_dim),
+        )
+
+        # Flow net: state + latent + timestep → latent velocity
+        layers: list[nn.Module] = []
+        in_dim = state_dim + latent_dim + 1
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.ReLU())
+            in_dim = h_dim
+        layers.append(nn.Linear(in_dim, latent_dim))
+        self.net = nn.Sequential(*layers)
+
+        self.current_step = 0
+
+        print(
+            f"Exp5LearnEDFlowMatchingPolicy: chunk_size={chunk_size} -> latent={after_scale_chunk_size}"
+        )
+
+    def compute_loss(
+        self,
+        state: torch.Tensor,        # [batch, state_dim]
+        action_chunk: torch.Tensor, # [batch, chunk_size, action_dim]
+    ) -> torch.Tensor:
+        batch_size = state.size(0)
+        x_1_flat = action_chunk.reshape(batch_size, -1)  # [batch, flat_action_dim]
+
+        # Encode to latent space
+        z_1 = self.encoder(x_1_flat)  # [batch, latent_dim]
+
+        # Flow matching in latent space
+        z_0 = torch.randn_like(z_1)
+        t = torch.rand(batch_size, 1, device=state.device)
+        z_t = (1.0 - t) * z_0 + t * z_1
+        u_t = z_1 - z_0  # target velocity
+        pred_u_t = self.net(torch.cat([state, z_t, t], dim=-1))
+        flow_loss = nn.functional.mse_loss(pred_u_t, u_t)
+
+        # Reconstruction loss: ensure decoder can invert encoder
+        recon_loss = nn.functional.mse_loss(self.decoder(z_1), x_1_flat)
+        
+        self.current_step += 1
+        if self.current_step > 10000: # 2w是验证
+            self.encoder.requires_grad_(False) # 这里不再更新encoder/decoder了
+            self.decoder.requires_grad_(False)
+            return flow_loss # + recon_loss
+        else:
+            return recon_loss  # 前期先专注于训练encoder-decoder，过渡一段时间后再加上flow loss
+    
+    def sample_actions(
+        self,
+        state: torch.Tensor,
+        *,
+        num_steps: int = 10,
+    ) -> torch.Tensor:
+        batch_size = state.size(0)
+        latent_dim = self.after_scale_chunk_size * self.action_dim
+
+        # Euler integration in latent space
+        z_t = torch.randn(batch_size, latent_dim, device=state.device)
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t = torch.full((batch_size, 1), i * dt, device=state.device)
+            z_t = z_t + self.net(torch.cat([state, z_t, t], dim=-1)) * dt
+
+        # Decode latent back to action space
+        x_flat = self.decoder(z_t)  # [batch, chunk_size * action_dim]
+        return x_flat.reshape(batch_size, self.chunk_size, self.action_dim)
+
+
 PolicyType: TypeAlias = Literal[
-    "mse", "flow", "exp2_sparse_flow", "exp3_beast_flow", "exp3_2_low_pass_flow"
+    "mse", "flow", "exp2_sparse_flow", "exp3_beast_flow", "exp3_2_low_pass_flow", "exp3_3_random_basis_flow", "exp5_learned_ed_flow"
 ]
 
 
@@ -528,5 +720,29 @@ def build_policy(
             after_scale_chunk_size=after_scale_chunk_size,
             hidden_dims=hidden_dims,
             kernel_size=kernel_size,
+        )
+    if policy_type == "exp3_3_random_basis_flow":
+        if after_scale_chunk_size is None:
+            raise ValueError(
+                "after_scale_chunk_size must be provided for exp3_3_random_basis_flow"
+            )
+        return Exp3_3RandomBasisFlowMatchingPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            after_scale_chunk_size=after_scale_chunk_size,
+            hidden_dims=hidden_dims,
+        )
+    if policy_type == "exp5_learned_ed_flow":
+        if after_scale_chunk_size is None:
+            raise ValueError(
+                "after_scale_chunk_size must be provided for exp5_learned_ed_flow"
+            )
+        return Exp5LearnEDFlowMatchingPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            after_scale_chunk_size=after_scale_chunk_size,
+            hidden_dims=hidden_dims,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")
