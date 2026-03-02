@@ -115,6 +115,10 @@ class TrainConfig:
     vq_codebook_size: int = 512
     # For exp3_3_D_VQ_VAE_flow: commitment loss coefficient.
     vq_commitment_cost: float = 0.25
+    # For exp4_beast_ae_flow: AE latent size (second compression stage after BEAST).
+    beast_ae_latent_size: int | None = None
+    # For exp4_free_knot_ae_flow: AE latent size (second compression stage after FreeKnot).
+    free_knot_ae_latent_size: int | None = None
 
     batch_size: int = 128
     lr: float = 3e-4
@@ -202,6 +206,8 @@ def run_training(config: TrainConfig) -> None:
         vae_beta=config.vae_beta,
         vq_codebook_size=config.vq_codebook_size,
         vq_commitment_cost=config.vq_commitment_cost,
+        beast_ae_latent_size=config.beast_ae_latent_size,
+        free_knot_ae_latent_size=config.free_knot_ae_latent_size,
     ).to(device)
 
     exp_name = f"seed_{config.seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"

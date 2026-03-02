@@ -857,10 +857,191 @@ class Exp3_3_D_VQ_VAE_FlowMatchingPolicy(BasePolicy):
         return self.decoder(zt).reshape(batch_size, self.chunk_size, self.action_dim)
 
 
+class Exp4_BEAST_AE_FlowMatchingPolicy(BasePolicy):
+    """Two-stage compression: BEAST B-spline -> AE, then flow matching in the AE latent space.
+
+    Pipeline: action (chunk_size, D)
+        --BEAST--> beast_latent (after_scale_chunk_size * D)
+        --AE-----> latent       (ae_latent_size)
+        <--AE----  beast_latent
+        <--BEAST-- action
+
+    Phase 1 (<= 10 000 steps): train AE (MSE reconstruction in BEAST space).
+    Phase 2 (> 10 000 steps): AE frozen, train flow net in ae_latent_size-dim space.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        after_scale_chunk_size: int,
+        hidden_dims: tuple[int, ...] = (128, 128),
+        ae_latent_size: int = 8,
+    ) -> None:
+        super().__init__(state_dim, action_dim, chunk_size)
+        self.after_scale_chunk_size = after_scale_chunk_size
+        self.ae_latent_size = ae_latent_size
+
+        from hw1_imitation.compressor.beast import BeastTokenizer
+        self.beast = BeastTokenizer(
+            num_dof=action_dim,
+            num_basis=after_scale_chunk_size,
+            seq_len=chunk_size,
+            degree_p=3,
+            device="cuda",
+        )
+
+        beast_dim = after_scale_chunk_size * action_dim
+        enc_hidden = hidden_dims[0]
+
+        self.ae_encoder = nn.Sequential(
+            nn.Linear(beast_dim, enc_hidden), nn.ReLU(),
+            nn.Linear(enc_hidden, ae_latent_size),
+        )
+        self.ae_decoder = nn.Sequential(
+            nn.Linear(ae_latent_size, enc_hidden), nn.ReLU(),
+            nn.Linear(enc_hidden, beast_dim),
+        )
+
+        layers: list[nn.Module] = []
+        in_dim = state_dim + ae_latent_size + 1
+        for h in hidden_dims:
+            layers.extend([nn.Linear(in_dim, h), nn.ReLU()])
+            in_dim = h
+        layers.append(nn.Linear(in_dim, ae_latent_size))
+        self.net = nn.Sequential(*layers)
+
+        self.current_step = 0
+        print(
+            f"Exp4_BEAST_AE_FlowMatchingPolicy: chunk_size={chunk_size} "
+            f"-> BEAST({after_scale_chunk_size}) -> AE({ae_latent_size})"
+        )
+
+    def compute_loss(self, state: torch.Tensor, action_chunk: torch.Tensor) -> torch.Tensor:
+        batch_size = state.size(0)
+        beast_latent = self.beast.encode_continuous(action_chunk, update_bounds=True)  # [B, beast_dim]
+        z = self.ae_encoder(beast_latent)  # [B, ae_latent_size]
+
+        self.current_step += 1
+        if self.current_step > 10_000:
+            self.ae_encoder.requires_grad_(False)
+            self.ae_decoder.requires_grad_(False)
+            z0 = torch.randn_like(z)
+            t = torch.rand(batch_size, 1, device=state.device)
+            zt = (1.0 - t) * z0 + t * z.detach()
+            ut = z.detach() - z0
+            return nn.functional.mse_loss(self.net(torch.cat([state, zt, t], dim=-1)), ut)
+        else:
+            recon = self.ae_decoder(z)
+            return nn.functional.mse_loss(recon, beast_latent)
+
+    def sample_actions(self, state: torch.Tensor, *, num_steps: int = 10) -> torch.Tensor:
+        batch_size = state.size(0)
+        zt = torch.randn(batch_size, self.ae_latent_size, device=state.device)
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t = torch.full((batch_size, 1), i * dt, device=state.device)
+            zt = zt + self.net(torch.cat([state, zt, t], dim=-1)) * dt
+        beast_latent = self.ae_decoder(zt)
+        return self.beast.decode_continuous(beast_latent)
+
+
+class Exp4_FreeKnot_AE_FlowMatchingPolicy(BasePolicy):
+    """Two-stage compression: FreeKnot B-spline -> AE, then flow matching in AE latent space.
+
+    Pipeline: action (chunk_size, D)
+        --FreeKnot--> fk_latent (spline.num_param)
+        --AE--------> latent    (ae_latent_size)
+        <--AE-----    fk_latent
+        <--FreeKnot-- action
+
+    Phase 1 (<= 10 000 steps): train AE (MSE recon in FreeKnot latent space).
+    Phase 2 (> 10 000 steps): AE frozen, train flow net in ae_latent_size-dim space.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        after_scale_chunk_size: int,
+        hidden_dims: tuple[int, ...] = (128, 128),
+        ae_latent_size: int = 8,
+        sample_distance: float = 1.0,
+        joint_knot: bool = True,
+    ) -> None:
+        super().__init__(state_dim, action_dim, chunk_size)
+        self.ae_latent_size = ae_latent_size
+        from hw1_imitation.compressor.free_knot import FreeKnotBSpline
+        self.spline_free = FreeKnotBSpline(
+            seq_len=chunk_size,
+            num_dof=action_dim,
+            num_cps=after_scale_chunk_size,
+            sample_distance=sample_distance,
+            joint_knot=joint_knot,
+        )
+
+        fk_dim = self.spline_free.num_param
+        enc_hidden = hidden_dims[0]
+
+        self.ae_encoder = nn.Sequential(
+            nn.Linear(fk_dim, enc_hidden), nn.ReLU(),
+            nn.Linear(enc_hidden, ae_latent_size),
+        )
+        self.ae_decoder = nn.Sequential(
+            nn.Linear(ae_latent_size, enc_hidden), nn.ReLU(),
+            nn.Linear(enc_hidden, fk_dim),
+        )
+
+        layers: list[nn.Module] = []
+        in_dim = state_dim + ae_latent_size + 1
+        for h in hidden_dims:
+            layers.extend([nn.Linear(in_dim, h), nn.ReLU()])
+            in_dim = h
+        layers.append(nn.Linear(in_dim, ae_latent_size))
+        self.net = nn.Sequential(*layers)
+
+        self.current_step = 0
+        print(
+            f"Exp4_FreeKnot_AE_FlowMatchingPolicy: chunk_size={chunk_size} "
+            f"-> FreeKnot(num_param={fk_dim}) -> AE({ae_latent_size})"
+        )
+
+    def compute_loss(self, state: torch.Tensor, action_chunk: torch.Tensor) -> torch.Tensor:
+        batch_size = state.size(0)
+        fk_latent = self.spline_free.encode_continuous(action_chunk)  # [B, fk_dim]
+        z = self.ae_encoder(fk_latent)  # [B, ae_latent_size]
+
+        self.current_step += 1
+        if self.current_step > 10_000:
+            self.ae_encoder.requires_grad_(False)
+            self.ae_decoder.requires_grad_(False)
+            z0 = torch.randn_like(z)
+            t = torch.rand(batch_size, 1, device=state.device)
+            zt = (1.0 - t) * z0 + t * z.detach()
+            ut = z.detach() - z0
+            return nn.functional.mse_loss(self.net(torch.cat([state, zt, t], dim=-1)), ut)
+        else:
+            recon = self.ae_decoder(z)
+            return nn.functional.mse_loss(recon, fk_latent)
+
+    def sample_actions(self, state: torch.Tensor, *, num_steps: int = 10) -> torch.Tensor:
+        batch_size = state.size(0)
+        zt = torch.randn(batch_size, self.ae_latent_size, device=state.device)
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t = torch.full((batch_size, 1), i * dt, device=state.device)
+            zt = zt + self.net(torch.cat([state, zt, t], dim=-1)) * dt
+        fk_latent = self.ae_decoder(zt)
+        return self.spline_free.decode_continuous(fk_latent)
+
+
 PolicyType: TypeAlias = Literal[
     "mse", "flow", "exp2_sparse_flow", "exp3_beast_flow", "exp3_2_low_pass_flow",
     "exp3_3_random_basis_flow", "exp3_3_B_AE_flow", "exp3_3_A_free_knot_flow",
-    "exp3_3_C_VAE_flow", "exp3_3_D_VQ_VAE_flow"
+    "exp3_3_C_VAE_flow", "exp3_3_D_VQ_VAE_flow", "exp4_beast_ae_flow",
+    "exp4_free_knot_ae_flow"
 ]
 
 
@@ -878,6 +1059,8 @@ def build_policy(
     vae_beta: float = 0.1,
     vq_codebook_size: int = 512,
     vq_commitment_cost: float = 0.25,
+    beast_ae_latent_size: int | None = None,
+    free_knot_ae_latent_size: int | None = None,
 ) -> BasePolicy:
     if policy_type == "mse":
         return MSEPolicy(
@@ -982,5 +1165,41 @@ def build_policy(
             hidden_dims=hidden_dims,
             codebook_size=vq_codebook_size,
             commitment_cost=vq_commitment_cost,
+        )
+    if policy_type == "exp4_beast_ae_flow":
+        if after_scale_chunk_size is None:
+            raise ValueError(
+                "after_scale_chunk_size must be provided for exp4_beast_ae_flow"
+            )
+        if beast_ae_latent_size is None:
+            raise ValueError(
+                "beast_ae_latent_size must be provided for exp4_beast_ae_flow"
+            )
+        return Exp4_BEAST_AE_FlowMatchingPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            after_scale_chunk_size=after_scale_chunk_size,
+            hidden_dims=hidden_dims,
+            ae_latent_size=beast_ae_latent_size,
+        )
+    if policy_type == "exp4_free_knot_ae_flow":
+        if after_scale_chunk_size is None:
+            raise ValueError(
+                "after_scale_chunk_size must be provided for exp4_free_knot_ae_flow"
+            )
+        if free_knot_ae_latent_size is None:
+            raise ValueError(
+                "free_knot_ae_latent_size must be provided for exp4_free_knot_ae_flow"
+            )
+        return Exp4_FreeKnot_AE_FlowMatchingPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            after_scale_chunk_size=after_scale_chunk_size,
+            hidden_dims=hidden_dims,
+            ae_latent_size=free_knot_ae_latent_size,
+            sample_distance=free_knot_sample_distance,
+            joint_knot=free_knot_joint_knot,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")
