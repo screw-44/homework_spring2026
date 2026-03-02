@@ -105,6 +105,10 @@ class TrainConfig:
     # For exp3_2_low_pass_flow: the kernel size of the low-pass Conv1d filter.
     # Ignored for other policy types.
     kernel_size: int | None = None
+    # For exp3_3_A_free_knot_flow: enumeration step size for free-knot candidates.
+    free_knot_sample_distance: float = 1.0
+    # For exp3_3_A_free_knot_flow: whether all dims share a single knot vector.
+    free_knot_joint_knot: bool = True
 
     batch_size: int = 128
     lr: float = 3e-4
@@ -187,6 +191,8 @@ def run_training(config: TrainConfig) -> None:
         hidden_dims=config.hidden_dims,
         after_scale_chunk_size=config.after_scale_chunk_size,
         kernel_size=config.kernel_size,
+        free_knot_sample_distance=config.free_knot_sample_distance,
+        free_knot_joint_knot=config.free_knot_joint_knot,
     ).to(device)
 
     exp_name = f"seed_{config.seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"

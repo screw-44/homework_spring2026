@@ -369,13 +369,13 @@ class Exp3_2LowPassFlowMatchingPolicy(BasePolicy):
         self.kernel_size = kernel_size # 需要测试为奇数
 
         # Low-pass filter: depthwise Conv1d (per-channel), same-length output.
-        # Initialized as a uniform averaging kernel.
+        # padding=0 here; replicate padding is applied manually in _filter.
         self.low_pass = nn.Conv1d(
             in_channels=action_dim,
             out_channels=action_dim,
             kernel_size=kernel_size,
             groups=action_dim,
-            padding="same",
+            padding=0,
             bias=False,
         )
         nn.init.constant_(self.low_pass.weight, 1.0 / kernel_size) # 初始化成均值滤波器
@@ -421,7 +421,9 @@ class Exp3_2LowPassFlowMatchingPolicy(BasePolicy):
         """
         # Conv1d expects (N, C, L)
         x = actions.permute(0, 2, 1)   # [batch, action_dim, chunk_size]
-        x = self.low_pass(x)           # [batch, action_dim, chunk_size]  (same padding)
+        pad = self.kernel_size // 2
+        x = nn.functional.pad(x, (pad, pad), mode="replicate")  # 用边缘值填充，避免零值污染均值
+        x = self.low_pass(x)           # [batch, action_dim, chunk_size]
         x = x.permute(0, 2, 1)         # [batch, chunk_size, action_dim]
         return self._interp(x, self.after_scale_chunk_size)
 
@@ -463,18 +465,9 @@ class Exp3_2LowPassFlowMatchingPolicy(BasePolicy):
         # Interpolate back to the real chunk_size
         return self._interp(scaled, self.chunk_size)
 
-# Note: 构造的encode和decode的误差太大了，不进行模型训练测试了。
-class Exp3_3RandomBasisFlowMatchingPolicy(BasePolicy):
-    """Flow matching policy whose latent space is a random orthogonal projection.
-
-    A fixed random orthogonal basis ``B`` of shape ``[chunk_size, after_scale_chunk_size]``
-    (orthonormal columns, B^T B = I) is constructed once at init and registered
-    as a non-trainable buffer.
-
-    - Encode: z = x @ B          [batch, chunk_size, D] → [batch, after_scale, D]
-    - Decode: x̂ = z @ B^T        [batch, after_scale, D] → [batch, chunk_size, D]
-
-    Network structure is identical to Exp2SparseFlowMatchingPolicy.
+class Exp3_3_AFreeKnotFlowMatchingPolicy(BasePolicy):
+    """ Flow matching policy that adaptively chooses B-spline control points based on the input state.
+        The network operates using FreeKnot bspline compression.
     """
 
     def __init__(
@@ -484,17 +477,23 @@ class Exp3_3RandomBasisFlowMatchingPolicy(BasePolicy):
         chunk_size: int,
         after_scale_chunk_size: int,
         hidden_dims: tuple[int, ...] = (128, 128),
+        sample_distance: float = 1.0,
+        joint_knot: bool = True,
     ) -> None:
         super().__init__(state_dim, action_dim, chunk_size)
         self.after_scale_chunk_size = after_scale_chunk_size
 
-        # Random orthogonal basis: QR decomposition of a random matrix.
-        # B: [chunk_size, after_scale_chunk_size],  B^T B = I
-        rand = torch.randn(chunk_size, after_scale_chunk_size)
-        B, _ = torch.linalg.qr(rand)          # B: [chunk_size, after_scale_chunk_size]
-        self.register_buffer("B", B)           # fixed, not a parameter
+        #@ 这个版本不包含normalization，和直接插值更公平的对比
+        from hw1_imitation.compressor.free_knot import FreeKnotBSpline
+        self.spline_free = FreeKnotBSpline(
+            seq_len=chunk_size,
+            num_dof=action_dim,
+            num_cps=after_scale_chunk_size,
+            sample_distance=sample_distance,
+            joint_knot=joint_knot,
+        )
 
-        flat_latent_dim = after_scale_chunk_size * action_dim
+        flat_latent_dim = self.spline_free.num_param
         layers: list[nn.Module] = []
         in_dim = state_dim + flat_latent_dim + 1
         for h_dim in hidden_dims:
@@ -503,15 +502,28 @@ class Exp3_3RandomBasisFlowMatchingPolicy(BasePolicy):
         layers.append(nn.Linear(in_dim, flat_latent_dim))
         self.net = nn.Sequential(*layers)
 
-        print(f"Exp3_3RandomBasisFlowMatchingPolicy: chunk_size={chunk_size} -> after_scale={after_scale_chunk_size}")
+        print(f"Exp3_3_AFreeKnotFlowMatchingPolicy: chunk_size={chunk_size}, num_cps={after_scale_chunk_size}, joint_knot={joint_knot}, sample_distance={sample_distance}, num_param={flat_latent_dim}")
 
-    def _encode(self, actions: torch.Tensor) -> torch.Tensor:
-        """Project [batch, chunk_size, action_dim] → [batch, after_scale, action_dim]."""
-        return torch.einsum("btd,tk->bkd", actions, self.B)
+    def _encode(self, action_chunk: torch.Tensor) -> torch.Tensor:
+        """Free knot B-spline encode each item in the batch.
 
-    def _decode(self, latent: torch.Tensor) -> torch.Tensor:
-        """Unproject [batch, after_scale, action_dim] → [batch, chunk_size, action_dim]."""
-        return torch.einsum("bkd,tk->btd", latent, self.B)
+        Args:
+            action_chunk: ``[batch, chunk_size, action_dim]``
+        Returns:
+            ``[batch,  self.spline_free.num_param]``
+        """
+        return self.spline_free.encode_continuous(action_chunk)
+  
+
+    def _decode(self, encoded_action_chunk: torch.Tensor) -> torch.Tensor:
+        """Free knot B-spline decode each item in the batch.
+
+        Args:
+            encoded_action_chunk: ``[batch,  self.spline_free.num_param]``
+        Returns:
+            ``[batch, chunk_size, action_dim]``
+        """
+        return self.spline_free.decode_continuous(encoded_action_chunk)
 
     def compute_loss(
         self,
@@ -519,12 +531,12 @@ class Exp3_3RandomBasisFlowMatchingPolicy(BasePolicy):
         action_chunk: torch.Tensor, # [batch, chunk_size, action_dim]
     ) -> torch.Tensor:
         batch_size = state.size(0)
-        x_1 = self._encode(action_chunk).reshape(batch_size, -1)  # [batch, flat_latent_dim]
+        x_1 = self._encode(action_chunk)  # [batch, self.spline_free.num_param]
 
         x_0 = torch.randn_like(x_1)
         t = torch.rand(batch_size, 1, device=state.device)
         x_t = (1.0 - t) * x_0 + t * x_1
-        u_t = x_1 - x_0
+        u_t = x_1 - x_0  # target velocity
 
         pred_u_t = self.net(torch.cat([state, x_t, t], dim=-1))
         return nn.functional.mse_loss(pred_u_t, u_t)
@@ -536,23 +548,18 @@ class Exp3_3RandomBasisFlowMatchingPolicy(BasePolicy):
         num_steps: int = 10,
     ) -> torch.Tensor:
         batch_size = state.size(0)
-        flat_latent_dim = self.after_scale_chunk_size * self.action_dim
+        flat_latent_dim = self.spline_free.num_param
 
+        # Euler integration in B-spline latent space
         x_t = torch.randn(batch_size, flat_latent_dim, device=state.device)
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((batch_size, 1), i * dt, device=state.device)
             x_t = x_t + self.net(torch.cat([state, x_t, t], dim=-1)) * dt
 
-        latent = x_t.reshape(batch_size, self.after_scale_chunk_size, self.action_dim)
-        return self._decode(latent)  # [batch, chunk_size, action_dim]
+        return self._decode(x_t)  # [batch, chunk_size, action_dim]
 
-class Exp4AdaptiveSplineFlowMatchingPolicy(BasePolicy):
-    """ Flow matching policy that adaptively chooses B-spline control points based on the input state."""
-    # 实现的难度很大，训练时间很久。先不测试
-    pass
-
-class Exp5LearnEDFlowMatchingPolicy(BasePolicy):
+class Exp3_3_BAEFlowMatchingPolicy(BasePolicy):
     """Flow matching policy with a learnable encoder/decoder compressing action space.
 
     - Encoder: flat action [chunk*D] → latent [after_scale*D]
@@ -601,7 +608,7 @@ class Exp5LearnEDFlowMatchingPolicy(BasePolicy):
         self.current_step = 0
 
         print(
-            f"Exp5LearnEDFlowMatchingPolicy: chunk_size={chunk_size} -> latent={after_scale_chunk_size}"
+            f"Exp33BAElowMatchingPolicy: chunk_size={chunk_size} -> latent={after_scale_chunk_size}"
         )
 
     def compute_loss(
@@ -655,8 +662,11 @@ class Exp5LearnEDFlowMatchingPolicy(BasePolicy):
         return x_flat.reshape(batch_size, self.chunk_size, self.action_dim)
 
 
+
+
 PolicyType: TypeAlias = Literal[
-    "mse", "flow", "exp2_sparse_flow", "exp3_beast_flow", "exp3_2_low_pass_flow", "exp3_3_random_basis_flow", "exp5_learned_ed_flow"
+    "mse", "flow", "exp2_sparse_flow", "exp3_beast_flow", "exp3_2_low_pass_flow",
+    "exp3_3_random_basis_flow", "exp3_3_B_AE_flow", "exp3_3_A_free_knot_flow"
 ]
 
 
@@ -669,6 +679,8 @@ def build_policy(
     hidden_dims: tuple[int, ...] = (128, 128),
     after_scale_chunk_size: int | None = None,
     kernel_size: int | None = None,
+    free_knot_sample_distance: float = 1.0,
+    free_knot_joint_knot: bool = True,
 ) -> BasePolicy:
     if policy_type == "mse":
         return MSEPolicy(
@@ -721,28 +733,30 @@ def build_policy(
             hidden_dims=hidden_dims,
             kernel_size=kernel_size,
         )
-    if policy_type == "exp3_3_random_basis_flow":
+    if policy_type == "exp3_3_B_AE_flow":
         if after_scale_chunk_size is None:
             raise ValueError(
-                "after_scale_chunk_size must be provided for exp3_3_random_basis_flow"
+                "after_scale_chunk_size must be provided for exp3_3_B_AE_flow"
             )
-        return Exp3_3RandomBasisFlowMatchingPolicy(
+        return Exp3_3_BAEFlowMatchingPolicy(
             state_dim=state_dim,
             action_dim=action_dim,
             chunk_size=chunk_size,
             after_scale_chunk_size=after_scale_chunk_size,
             hidden_dims=hidden_dims,
         )
-    if policy_type == "exp5_learned_ed_flow":
+    if policy_type == "exp3_3_A_free_knot_flow":
         if after_scale_chunk_size is None:
             raise ValueError(
-                "after_scale_chunk_size must be provided for exp5_learned_ed_flow"
+                "after_scale_chunk_size must be provided for exp3_3_A_free_knot_flow"
             )
-        return Exp5LearnEDFlowMatchingPolicy(
+        return Exp3_3_AFreeKnotFlowMatchingPolicy(
             state_dim=state_dim,
             action_dim=action_dim,
             chunk_size=chunk_size,
             after_scale_chunk_size=after_scale_chunk_size,
             hidden_dims=hidden_dims,
+            sample_distance=free_knot_sample_distance,
+            joint_knot=free_knot_joint_knot,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")
