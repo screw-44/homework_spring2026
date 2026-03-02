@@ -662,11 +662,205 @@ class Exp3_3_BAEFlowMatchingPolicy(BasePolicy):
         return x_flat.reshape(batch_size, self.chunk_size, self.action_dim)
 
 
+class Exp3_3_C_VAE_FlowMatchingPolicy(BasePolicy):
+    """Flow matching in a β-VAE latent space.
+
+    Phase 1 (≤ 10 000 steps): train VAE (recon + β·KL loss).
+    Phase 2 (> 10 000 steps): train flow net only; encoder/decoder frozen.
+    Flow net targets the deterministic μ encoding (not the stochastic sample).
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        after_scale_chunk_size: int,
+        hidden_dims: tuple[int, ...] = (128, 128),
+        beta: float = 0.1,
+    ) -> None:
+        super().__init__(state_dim, action_dim, chunk_size)
+        self.after_scale_chunk_size = after_scale_chunk_size
+        self.beta = beta
+        flat_action_dim = chunk_size * action_dim
+        latent_dim = after_scale_chunk_size * action_dim
+        enc_hidden = hidden_dims[0]
+
+        self.encoder_base = nn.Sequential(
+            nn.Linear(flat_action_dim, enc_hidden), nn.ReLU()
+        )
+        self.fc_mu      = nn.Linear(enc_hidden, latent_dim)
+        self.fc_log_var = nn.Linear(enc_hidden, latent_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, enc_hidden), nn.ReLU(),
+            nn.Linear(enc_hidden, flat_action_dim),
+        )
+
+        layers: list[nn.Module] = []
+        in_dim = state_dim + latent_dim + 1
+        for h in hidden_dims:
+            layers.extend([nn.Linear(in_dim, h), nn.ReLU()])
+            in_dim = h
+        layers.append(nn.Linear(in_dim, latent_dim))
+        self.net = nn.Sequential(*layers)
+
+        self.current_step = 0
+        print(f"Exp3_3_C_VAE_FlowMatchingPolicy: chunk_size={chunk_size}, latent={after_scale_chunk_size}, beta={beta}")
+
+    def _encode(self, x_flat: torch.Tensor):
+        h = self.encoder_base(x_flat)
+        mu, log_var = self.fc_mu(h), self.fc_log_var(h)
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * log_var)
+        return z, mu, log_var
+
+    def compute_loss(
+        self,
+        state: torch.Tensor,
+        action_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = state.size(0)
+        x_flat = action_chunk.reshape(batch_size, -1)
+        z, mu, log_var = self._encode(x_flat)
+
+        recon_loss = nn.functional.mse_loss(self.decoder(z), x_flat)
+        kl_loss    = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+
+        self.current_step += 1
+        if self.current_step > 10_000:
+            for m in (self.encoder_base, self.fc_mu, self.fc_log_var, self.decoder):
+                m.requires_grad_(False)
+            # flow net targets μ (deterministic)
+            z0 = torch.randn_like(mu)
+            t  = torch.rand(batch_size, 1, device=state.device)
+            zt = (1.0 - t) * z0 + t * mu.detach()
+            ut = mu.detach() - z0
+            return nn.functional.mse_loss(self.net(torch.cat([state, zt, t], dim=-1)), ut)
+        else:
+            return recon_loss + self.beta * kl_loss
+
+    def sample_actions(
+        self,
+        state: torch.Tensor,
+        *,
+        num_steps: int = 10,
+    ) -> torch.Tensor:
+        batch_size = state.size(0)
+        latent_dim = self.after_scale_chunk_size * self.action_dim
+        zt = torch.randn(batch_size, latent_dim, device=state.device)
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t = torch.full((batch_size, 1), i * dt, device=state.device)
+            zt = zt + self.net(torch.cat([state, zt, t], dim=-1)) * dt
+        return self.decoder(zt).reshape(batch_size, self.chunk_size, self.action_dim)
+
+
+class Exp3_3_D_VQ_VAE_FlowMatchingPolicy(BasePolicy):
+    """Flow matching in a VQ-VAE latent space.
+
+    Phase 1 (≤ 10 000 steps): train VQ-VAE (recon + codebook + commitment losses).
+    Phase 2 (> 10 000 steps): train flow net only; encoder/decoder/codebook frozen.
+    Flow net targets the nearest-neighbour quantised code.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        after_scale_chunk_size: int,
+        hidden_dims: tuple[int, ...] = (128, 128),
+        codebook_size: int = 512,
+        commitment_cost: float = 0.25,
+    ) -> None:
+        super().__init__(state_dim, action_dim, chunk_size)
+        self.after_scale_chunk_size = after_scale_chunk_size
+        self.commitment_cost = commitment_cost
+        flat_action_dim = chunk_size * action_dim
+        latent_dim = after_scale_chunk_size * action_dim
+        enc_hidden = hidden_dims[0]
+
+        self.encoder = nn.Sequential(
+            nn.Linear(flat_action_dim, enc_hidden), nn.ReLU(),
+            nn.Linear(enc_hidden, latent_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, enc_hidden), nn.ReLU(),
+            nn.Linear(enc_hidden, flat_action_dim),
+        )
+        self.codebook = nn.Embedding(codebook_size, latent_dim)
+        nn.init.uniform_(self.codebook.weight, -1.0 / codebook_size, 1.0 / codebook_size)
+
+        layers: list[nn.Module] = []
+        in_dim = state_dim + latent_dim + 1
+        for h in hidden_dims:
+            layers.extend([nn.Linear(in_dim, h), nn.ReLU()])
+            in_dim = h
+        layers.append(nn.Linear(in_dim, latent_dim))
+        self.net = nn.Sequential(*layers)
+
+        self.current_step = 0
+        print(f"Exp3_3_D_VQ_VAE_FlowMatchingPolicy: chunk_size={chunk_size}, latent={after_scale_chunk_size}, codebook_size={codebook_size}")
+
+    def _quantize(self, z_e: torch.Tensor):
+        """Nearest-neighbour VQ with straight-through gradient."""
+        # squared distances [B, codebook_size]
+        d = (
+            z_e.pow(2).sum(1, keepdim=True)
+            - 2 * (z_e @ self.codebook.weight.t())
+            + self.codebook.weight.pow(2).sum(1)
+        )
+        z_q = self.codebook(d.argmin(dim=1))                            # [B, latent_dim]
+        codebook_loss   = nn.functional.mse_loss(z_q, z_e.detach())     # codebook ← encoder
+        commitment_loss = nn.functional.mse_loss(z_e, z_q.detach())     # encoder commits
+        vq_loss = codebook_loss + self.commitment_cost * commitment_loss
+        z_q_st = z_e + (z_q - z_e).detach()                            # straight-through
+        return z_q_st, z_q, vq_loss
+
+    def compute_loss(
+        self,
+        state: torch.Tensor,
+        action_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = state.size(0)
+        x_flat = action_chunk.reshape(batch_size, -1)
+        z_e = self.encoder(x_flat)
+        z_q_st, z_q, vq_loss = self._quantize(z_e)
+
+        recon_loss = nn.functional.mse_loss(self.decoder(z_q_st), x_flat)
+
+        self.current_step += 1
+        if self.current_step > 10_000:
+            for m in (self.encoder, self.decoder, self.codebook):
+                m.requires_grad_(False)
+            # flow net targets the quantised code
+            z0 = torch.randn_like(z_q)
+            t  = torch.rand(batch_size, 1, device=state.device)
+            zt = (1.0 - t) * z0 + t * z_q.detach()
+            ut = z_q.detach() - z0
+            return nn.functional.mse_loss(self.net(torch.cat([state, zt, t], dim=-1)), ut)
+        else:
+            return recon_loss + vq_loss
+
+    def sample_actions(
+        self,
+        state: torch.Tensor,
+        *,
+        num_steps: int = 10,
+    ) -> torch.Tensor:
+        batch_size = state.size(0)
+        latent_dim = self.after_scale_chunk_size * self.action_dim
+        zt = torch.randn(batch_size, latent_dim, device=state.device)
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t = torch.full((batch_size, 1), i * dt, device=state.device)
+            zt = zt + self.net(torch.cat([state, zt, t], dim=-1)) * dt
+        return self.decoder(zt).reshape(batch_size, self.chunk_size, self.action_dim)
 
 
 PolicyType: TypeAlias = Literal[
     "mse", "flow", "exp2_sparse_flow", "exp3_beast_flow", "exp3_2_low_pass_flow",
-    "exp3_3_random_basis_flow", "exp3_3_B_AE_flow", "exp3_3_A_free_knot_flow"
+    "exp3_3_random_basis_flow", "exp3_3_B_AE_flow", "exp3_3_A_free_knot_flow",
+    "exp3_3_C_VAE_flow", "exp3_3_D_VQ_VAE_flow"
 ]
 
 
@@ -681,6 +875,9 @@ def build_policy(
     kernel_size: int | None = None,
     free_knot_sample_distance: float = 1.0,
     free_knot_joint_knot: bool = True,
+    vae_beta: float = 0.1,
+    vq_codebook_size: int = 512,
+    vq_commitment_cost: float = 0.25,
 ) -> BasePolicy:
     if policy_type == "mse":
         return MSEPolicy(
@@ -758,5 +955,32 @@ def build_policy(
             hidden_dims=hidden_dims,
             sample_distance=free_knot_sample_distance,
             joint_knot=free_knot_joint_knot,
+        )
+    if policy_type == "exp3_3_C_VAE_flow":
+        if after_scale_chunk_size is None:
+            raise ValueError(
+                "after_scale_chunk_size must be provided for exp3_3_C_VAE_flow"
+            )
+        return Exp3_3_C_VAE_FlowMatchingPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            after_scale_chunk_size=after_scale_chunk_size,
+            hidden_dims=hidden_dims,
+            beta=vae_beta,
+        )
+    if policy_type == "exp3_3_D_VQ_VAE_flow":
+        if after_scale_chunk_size is None:
+            raise ValueError(
+                "after_scale_chunk_size must be provided for exp3_3_D_VQ_VAE_flow"
+            )
+        return Exp3_3_D_VQ_VAE_FlowMatchingPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            after_scale_chunk_size=after_scale_chunk_size,
+            hidden_dims=hidden_dims,
+            codebook_size=vq_codebook_size,
+            commitment_cost=vq_commitment_cost,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")

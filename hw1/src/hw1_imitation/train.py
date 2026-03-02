@@ -109,6 +109,12 @@ class TrainConfig:
     free_knot_sample_distance: float = 1.0
     # For exp3_3_A_free_knot_flow: whether all dims share a single knot vector.
     free_knot_joint_knot: bool = True
+    # For exp3_3_C_VAE_flow: KL weight in β-VAE loss.
+    vae_beta: float = 0.05
+    # For exp3_3_D_VQ_VAE_flow: number of codebook entries.
+    vq_codebook_size: int = 512
+    # For exp3_3_D_VQ_VAE_flow: commitment loss coefficient.
+    vq_commitment_cost: float = 0.25
 
     batch_size: int = 128
     lr: float = 3e-4
@@ -193,6 +199,9 @@ def run_training(config: TrainConfig) -> None:
         kernel_size=config.kernel_size,
         free_knot_sample_distance=config.free_knot_sample_distance,
         free_knot_joint_knot=config.free_knot_joint_knot,
+        vae_beta=config.vae_beta,
+        vq_codebook_size=config.vq_codebook_size,
+        vq_commitment_cost=config.vq_commitment_cost,
     ).to(device)
 
     exp_name = f"seed_{config.seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
